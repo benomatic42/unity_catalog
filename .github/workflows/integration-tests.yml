@@ -1,7 +1,8 @@
 # Integration tests for the unity_catalog extension: build ONE test binary (BUILD_KIND, default
 # release), then run it against a Local (OSS Unity Catalog container) and a Cloud (live Databricks)
 # target. Cloud is gated by the `cloud` environment (required reviewer) -- a PR can request it, but
-# only an admin releases the secrets. The driver comes from its git pin in pyproject.toml (no
+# only an admin releases the secrets. A fork PR gets no secrets on pull_request; run it through the
+# manual PR gate instead (workflow_dispatch with `pr`, below). The driver comes from its git pin in pyproject.toml (no
 # side-by-side checkout); MainDistribution builds the shipping binary separately.
 
 name: Integration Tests
@@ -11,9 +12,31 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    # Manual PR gate: set `pr` to run this suite against a pull request, fork PRs included.
+    # A pull_request run from a fork never gets secrets, so a PR is tested only this way.
+    # SECURITY: this runs the PR's code with this repo's cloud secrets. Read the PR at the sha
+    # you mean to test first. The PR jobs wait in the `cloud` environment (required reviewer)
+    # before any PR code runs; approve only after checking the sha in the "Resolve PR" summary.
+    inputs:
+      pr:
+        description: "PR number to test (empty: test the branch this is dispatched on)"
+        required: false
+        default: ""
+      sha:
+        description: "Expected PR head sha (optional, >= 7 chars): fail if the PR has moved"
+        required: false
+        default: ""
+      merge:
+        description: "Test refs/pull/<pr>/merge (the PR merged into its base) instead of its head"
+        type: boolean
+        default: false
+
+# The PR's code sees GITHUB_TOKEN; keep it read-only. Jobs that post the commit status widen it.
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-pr${{ inputs.pr || '' }}
   cancel-in-progress: true
 
 defaults:
@@ -30,10 +53,89 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # PR gate, step 1 (no secrets, runs no PR code): pin the sha to test and mark it pending.
+  # ---------------------------------------------------------------------------
+  pr-resolve:
+    name: Resolve PR
+    if: github.event_name == 'workflow_dispatch' && inputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      head: ${{ steps.resolve.outputs.head }}
+      desc: ${{ steps.resolve.outputs.desc }}
+    steps:
+      - name: Resolve PR head (or merge ref) to a sha
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+          EXPECT_SHA: ${{ inputs.sha }}
+          MERGE: ${{ inputs.merge }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::input pr must be a PR number, got '$PR'"; exit 1; }
+          [[ -z "$EXPECT_SHA" || "$EXPECT_SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::input sha must be 7-40 hex chars"; exit 1; }
+          pr_json=$(gh api "repos/$REPO/pulls/$PR")
+          state=$(jq -r .state <<<"$pr_json")
+          head=$(jq -r .head.sha <<<"$pr_json")
+          label=$(jq -r .head.label <<<"$pr_json")
+          base=$(jq -r .base.ref <<<"$pr_json")
+          [[ "$state" == open ]] || { echo "::error::PR #$PR is $state"; exit 1; }
+          if [[ -n "$EXPECT_SHA" && "$head" != "$EXPECT_SHA"* ]]; then
+            echo "::error::PR #$PR head is $head, not $EXPECT_SHA: it moved; review and dispatch again"
+            exit 1
+          fi
+          sha=$head
+          desc="head ${head:0:10}"
+          if [[ "$MERGE" == true ]]; then
+            # GitHub computes the test merge commit in the background; wait for it.
+            mergeable=null
+            for _ in 1 2 3 4 5 6; do
+              mergeable=$(jq -r .mergeable <<<"$pr_json")
+              [[ "$mergeable" != null ]] && break
+              sleep 10
+              pr_json=$(gh api "repos/$REPO/pulls/$PR")
+            done
+            [[ "$(jq -r .head.sha <<<"$pr_json")" == "$head" ]] || { echo "::error::PR #$PR moved while resolving"; exit 1; }
+            [[ "$mergeable" == true ]] || { echo "::error::PR #$PR has no merge ref (mergeable=$mergeable)"; exit 1; }
+            sha=$(jq -r .merge_commit_sha <<<"$pr_json")
+            parent=$(gh api "repos/$REPO/commits/$sha" --jq '.parents[1].sha')
+            [[ "$parent" == "$head" ]] || { echo "::error::merge ref $sha is not on head $head; retry"; exit 1; }
+            desc="merge ${sha:0:10} of head ${head:0:10} into $base"
+          fi
+          {
+            echo "sha=$sha"
+            echo "head=$head"
+            echo "desc=$desc"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Cloud PR gate: PR #$PR"
+            echo
+            echo "- PR branch: \`$label\` -> \`$base\`"
+            echo "- head: \`$head\`"
+            echo "- testing: \`$sha\` ($([[ "$MERGE" == true ]] && echo merge ref || echo head))"
+            echo
+            echo "Approve the \`cloud\` deployment only if this is the sha you reviewed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/$REPO/statuses/$head" -f state=pending -f context=cloud-pr-gate \
+            -f target_url="$RUN_URL" -f description="waiting for approval: $desc" > /dev/null
+
+  # ---------------------------------------------------------------------------
   # Build ONE binary + extensions; hand them to Local/Cloud as an artifact.
   # ---------------------------------------------------------------------------
   build:
     name: Build
+    needs: pr-resolve
+    # Without `pr` the resolve job is skipped and this runs as before. With `pr` it builds the PR's
+    # code, so it waits for the `cloud` environment's reviewer first (Cloud then asks again).
+    if: ${{ !cancelled() && needs.pr-resolve.result != 'failure' }}
+    environment: ${{ needs.pr-resolve.outputs.sha != '' && 'cloud' || '' }}
     runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
@@ -49,8 +151,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.pr-resolve.outputs.sha }}
           fetch-depth: 0
           submodules: true
+          persist-credentials: ${{ needs.pr-resolve.outputs.sha == '' }}
+
+      - name: PR under test
+        if: needs.pr-resolve.outputs.sha != ''
+        env:
+          PR: ${{ inputs.pr }}
+          SHA: ${{ needs.pr-resolve.outputs.sha }}
+        run: |
+          echo "Testing PR #$PR at $SHA"
+          test "$(git rev-parse HEAD)" = "$SHA"
+          # PR runs read the caches but never write them.
+          cat >> "$GITHUB_ENV" <<EOF
+          SCCACHE_GHA_RW_MODE=READ_ONLY
+          VCPKG_BINARY_SOURCES=clear;http,https://vcpkg-cache.duckdb.org,read
+          EOF
 
       - name: Configure OpenSSL for Rust
         run: |
@@ -71,8 +189,9 @@ jobs:
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
-      - name: Cache vcpkg built packages
-        uses: actions/cache@v4
+      - name: Restore vcpkg built packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: build/${{ env.BUILD_KIND }}/vcpkg_installed
           # duckdb/vcpkg.json: USE_MERGED_VCPKG_MANIFEST folds duckdb's own vcpkg deps into the manifest.
@@ -85,6 +204,13 @@ jobs:
         run: |
           make $BUILD_KIND
           sccache --show-stats || true
+
+      - name: Save vcpkg built packages
+        if: needs.pr-resolve.outputs.sha == '' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/${{ env.BUILD_KIND }}/vcpkg_installed
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       # The repository is this build's own set of installable extensions, and `require <name>` in a
       # sqllogictest body reaches for it: autoinstall defaults to it by absolute path, so a test job
@@ -109,13 +235,17 @@ jobs:
   # ---------------------------------------------------------------------------
   local:
     name: Local (OSS Unity Catalog)
-    needs: build
+    needs: [pr-resolve, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       DUCKTEST_UC_IMAGE: ghcr.io/benfleis/ducktest-unitycatalog:ci
     steps:
       - uses: actions/checkout@v4 # test files + pyproject + scripts; binary comes from the artifact
+        with:
+          ref: ${{ needs.pr-resolve.outputs.sha }}
+          persist-credentials: ${{ needs.pr-resolve.outputs.sha == '' }}
 
       - name: Download the test binary
         uses: actions/download-artifact@v4
@@ -147,19 +277,24 @@ jobs:
   # ---------------------------------------------------------------------------
   cloud:
     name: Cloud (Databricks)
-    needs: build
-    # Trusted refs only: pushes to main and workflow_dispatch, plus PRs whose branch lives in this
-    # repo (duckdb-org, not a fork). Fork PRs never receive secrets, so they'd only fail -- skip
-    # them. (The `environment: cloud` required-reviewer protection is the secret-release layer.)
+    needs: [pr-resolve, build]
+    # Trusted refs only: pushes to main and workflow_dispatch (with `pr`: the manual PR gate), plus
+    # PRs whose branch lives in this repo (duckdb-org, not a fork). Fork PRs never receive secrets on
+    # pull_request, so they'd only fail -- skip them. (The `environment: cloud` required-reviewer
+    # protection is the secret-release layer.)
     if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      !cancelled() && needs.build.result == 'success' && (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-latest' }}
     timeout-minutes: 30
     environment: cloud
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.pr-resolve.outputs.sha }}
+          persist-credentials: ${{ needs.pr-resolve.outputs.sha == '' }}
 
       - name: Download the test binary
         uses: actions/download-artifact@v4
@@ -182,3 +317,32 @@ jobs:
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: LD_LIBRARY_PATH="$PWD/build/$BUILD_KIND/src" BUILD_DIR=build/$BUILD_KIND scripts/env_databricks uv run pytest -m databricks -n0 -s
+
+  # ---------------------------------------------------------------------------
+  # PR gate, last step: report the result on the PR head sha.
+  # ---------------------------------------------------------------------------
+  pr-status:
+    name: Report PR status
+    needs: [pr-resolve, build, local, cloud]
+    if: ${{ always() && needs.pr-resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Post commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ needs.pr-resolve.outputs.head }}
+          DESC: ${{ needs.pr-resolve.outputs.desc }}
+          RESULTS: build=${{ needs.build.result }} local=${{ needs.local.result }} cloud=${{ needs.cloud.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$RESULTS" in
+            "build=success local=success cloud=success") state=success ;;
+            *failure*) state=failure ;;
+            *) state=error ;;
+          esac
+          gh api "repos/$REPO/statuses/$HEAD_SHA" -f state="$state" -f context=cloud-pr-gate \
+            -f target_url="$RUN_URL" -f description="$state: $DESC" > /dev/null
